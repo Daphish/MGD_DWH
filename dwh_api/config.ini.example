@@ -1,0 +1,13 @@
+[database]
+; Conexión a la BD de configuración (MySQL). Misma BD que usa el backend.
+host = 127.0.0.1
+port = 3306
+db = mgd_dwh_config
+user = root
+password = TU_PASSWORD_AQUI
+
+[monitor]
+; URL del Monitor API o del backend (según la app).
+api_url = http://127.0.0.1:8000
+token = TU_TOKEN_MONITOR
+poll_seconds = 30

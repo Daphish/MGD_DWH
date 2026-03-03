@@ -1,0 +1,37 @@
+# Credenciales y config con datos sensibles
+**/config.ini
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+.env/
+
+# Ejecutables y builds
+dist/
+build/
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Otros
+.DS_Store
+Thumbs.db

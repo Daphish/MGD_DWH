@@ -1,0 +1,7 @@
+[nexus]
+; Token único que identifica la razón social de este cliente.
+; El servidor lo usa para saber qué configuraciones enviar.
+token = TU_TOKEN_AQUI
+
+; URL base de la API del servidor DWH.
+api_url = http://127.0.0.1:8000

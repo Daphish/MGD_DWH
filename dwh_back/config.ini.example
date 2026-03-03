@@ -1,0 +1,8 @@
+[database]
+; Conexión a la BD de configuración (MySQL).
+; Copia este archivo como config.ini y ajusta los valores.
+host = 127.0.0.1
+port = 3306
+db = mgd_dwh_config
+user = root
+password = TU_PASSWORD_AQUI
