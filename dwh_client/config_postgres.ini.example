@@ -1,0 +1,20 @@
+[nexus]
+; Company token (legacy/current flow).
+; Use this when the client should execute only one company / reason_social.
+token = TU_TOKEN_AQUI
+
+; Group token (new special flow).
+; If present, the client will call /group-configs and execute tasks from every
+; company that belongs to the group. Leave empty to keep company mode.
+; Takes priority over agency_token and token.
+group_token =
+
+; Agency token (single branch / dealership).
+; If set (and group_token is empty), the client calls /agency-configs and only
+; runs tasks linked to that agency row. Requires agency.agency_token in the config DB.
+; Takes priority over company token.
+agency_token =
+
+; Base URL of the backend API.
+; Use HTTPS in real deployments. HTTP is acceptable only for localhost/dev.
+api_url = http://127.0.0.1:8000

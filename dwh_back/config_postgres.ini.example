@@ -1,0 +1,17 @@
+[database]
+; Conexión a la BD de configuración (PostgreSQL).
+; Copia este archivo como config.ini y ajusta los valores.
+host = 127.0.0.1
+port = 5432
+db = mgd_dwh_config
+user = postgres
+password = TU_PASSWORD_AQUI
+
+[monitor]
+; Token para acceder a los endpoints /monitor/*
+; token = TU_MONITOR_TOKEN
+
+[security]
+; Optional master key for decrypting ENC:... values stored in the config DB.
+; You can also provide it via the NEXUS_CONFIG_SECRET_KEY environment variable.
+; config_secret_key = TU_FERNET_KEY_AQUI

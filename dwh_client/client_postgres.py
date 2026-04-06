@@ -1,9 +1,11 @@
 """
-nexus_client.py  v3
-────────────────────
-Cliente ETL. Lee su configuración del backend usando su token de razón social.
-Reporta cada ejecución (exitosa o fallida) al backend para que el monitor
-pueda ver grupo + RS + detalle de cada evento.
+nexus_client_postgres.py  v3 — PostgreSQL
+───────────────────────────────────────────
+Cliente ETL que carga datos en PostgreSQL (DWH destino).
+Lee su configuración del backend usando token de razón social, grupo o agencia.
+Reporta cada ejecución (exitosa o fallida) al backend.
+Origen: MySQL, SQL Server o PostgreSQL (según origen_tipo en config).
+Destino: PostgreSQL (psycopg2).
 """
 
 import configparser
@@ -17,7 +19,12 @@ from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
+import io
+
+import psycopg2
+import psycopg2.extras
 import pymysql
 import pyodbc
 import requests
@@ -42,12 +49,16 @@ def load_ini() -> configparser.ConfigParser:
     return cfg
 
 
-_ini         = load_ini()
-API_BASE_URL = _ini.get("nexus", "api_url", fallback="http://127.0.0.1:8000")
-CLIENT_TOKEN = _ini.get("nexus", "token",   fallback="")
+_ini = load_ini()
+API_BASE_URL = _ini.get("nexus", "api_url", fallback="http://127.0.0.1:8000").strip()
+COMPANY_API_TOKEN = _ini.get("nexus", "token", fallback="").strip()
+GROUP_API_TOKEN = _ini.get("nexus", "group_token", fallback="").strip()
+AGENCY_API_TOKEN = _ini.get("nexus", "agency_token", fallback="").strip()
 
-if not CLIENT_TOKEN:
-    print("Falta [nexus] token en config.ini")
+if not COMPANY_API_TOKEN and not GROUP_API_TOKEN and not AGENCY_API_TOKEN:
+    print(
+        "Falta al menos uno de: [nexus] token, [nexus] group_token, [nexus] agency_token en config.ini"
+    )
     sys.exit(1)
 
 
@@ -88,22 +99,128 @@ log.addHandler(_ch)
 # ─────────────────────────────────────────────────────────────────────────────
 # Estado global
 # ─────────────────────────────────────────────────────────────────────────────
-_verbose:      bool         = False
-_dwh_config:   Dict[str, Any] = {}
-_source_config: Dict[str, Any] = {}
+_verbose: bool = False
+_warehouse_config: Dict[str, Any] = {}
+_default_source_config: Dict[str, Any] = {}
+
+
+def is_group_mode() -> bool:
+    return bool(GROUP_API_TOKEN)
+
+
+def is_agency_mode() -> bool:
+    """Una sola agencia: prioridad por debajo de group_token."""
+    return bool(AGENCY_API_TOKEN) and not is_group_mode()
+
+
+def _client_mode_label() -> str:
+    if is_group_mode():
+        return "group"
+    if is_agency_mode():
+        return "agency"
+    return "company"
+
+
+def _mask_active_client_token() -> str:
+    if is_group_mode():
+        return _mask_secret(GROUP_API_TOKEN)
+    if is_agency_mode():
+        return _mask_secret(AGENCY_API_TOKEN)
+    return _mask_secret(COMPANY_API_TOKEN)
+
+
+def _mask_secret(secret: str) -> str:
+    if not secret:
+        return "(empty)"
+    if len(secret) <= 6:
+        return "*" * len(secret)
+    return f"{secret[:3]}...{secret[-2:]}"
+
+
+def validate_api_url_security() -> None:
+    parsed = urlparse(API_BASE_URL)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https":
+        return
+    if host in {"127.0.0.1", "localhost"}:
+        return
+    log.warning(
+        "API URL sin HTTPS para host no local. Usa TLS en producción: %s",
+        API_BASE_URL,
+    )
+
+
+def build_api_headers() -> Dict[str, str]:
+    if is_group_mode():
+        return {"x-group-token": GROUP_API_TOKEN}
+    if is_agency_mode():
+        return {"x-agency-token": AGENCY_API_TOKEN}
+    return {"x-token": COMPANY_API_TOKEN}
+
+
+def redact_sensitive_text(text: str, extra_values: Optional[Sequence[str]] = None) -> str:
+    redacted = text or ""
+    sensitive_values = [
+        COMPANY_API_TOKEN,
+        GROUP_API_TOKEN,
+        AGENCY_API_TOKEN,
+        _warehouse_config.get("pass", ""),
+        _default_source_config.get("pass", ""),
+    ]
+    if extra_values:
+        sensitive_values.extend(extra_values)
+    for value in sensitive_values:
+        if value:
+            redacted = redacted.replace(value, "***REDACTED***")
+    return redacted
+
+
+def _empty_runtime_config() -> Dict[str, Any]:
+    return {
+        "status": "unreachable",
+        "log_verbose": False,
+        "refresh_seconds": 60,
+        "configs": [],
+        "dwh": {},
+        "source": {},
+    }
+
+
+def _normalize_source_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "tipo": (data.get("origen_tipo") or data.get("source_type") or "sqlserver").lower(),
+        "ip": data.get("origen_ip") or data.get("source_host") or "",
+        "port": data.get("origen_port") or data.get("source_port") or 1433,
+        "db": data.get("origen_db") or data.get("source_db") or data.get("source_database") or "",
+        "user": data.get("origen_user") or data.get("source_user") or data.get("source_username") or "",
+        "pass": data.get("origen_pass") or data.get("source_pass") or data.get("source_password") or "",
+        "dsn_odbc": data.get("dsn_odbc") or data.get("source_dsn") or "",
+    }
+
+
+def _normalize_warehouse_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "host": data.get("dwh_host") or data.get("warehouse_host") or "",
+        "port": data.get("dwh_port") or data.get("warehouse_port") or 5432,
+        "db": data.get("dwh_db") or data.get("warehouse_db") or data.get("warehouse_database") or "",
+        "user": data.get("dwh_user") or data.get("warehouse_user") or data.get("warehouse_username") or "",
+        "pass": data.get("dwh_pass") or data.get("warehouse_pass") or data.get("warehouse_password") or "",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API — obtener configuraciones
 # ─────────────────────────────────────────────────────────────────────────────
-def fetch_configs() -> Dict[str, Any]:
-    url     = f"{API_BASE_URL}/configs"
-    headers = {"x-token": CLIENT_TOKEN}
-    empty: Dict[str, Any] = {
-        "status": "unreachable", "log_verbose": False,
-        "refresh_seconds": 60,  "configs": [],
-        "dwh": {},              "source": {},
-    }
+def fetch_runtime_config() -> Dict[str, Any]:
+    if is_group_mode():
+        endpoint = "/group-configs"
+    elif is_agency_mode():
+        endpoint = "/agency-configs"
+    else:
+        endpoint = "/configs"
+    url = f"{API_BASE_URL}{endpoint}"
+    headers = build_api_headers()
+    empty = _empty_runtime_config()
 
     try:
         r = requests.get(url, headers=headers, timeout=10)
@@ -118,28 +235,25 @@ def fetch_configs() -> Dict[str, Any]:
 
     r.raise_for_status()
     data = r.json()
-    return {
-        "status":          "ok",
-        "log_verbose":     data.get("log_verbose", False),
+    runtime = {
+        "status": "ok",
+        "log_verbose": data.get("log_verbose", False),
         "refresh_seconds": data.get("refresh_seconds", 60),
-        "configs":         data.get("configs", []),
-        "dwh": {
-            "host": data.get("dwh_host", ""), "port": data.get("dwh_port", 3306),
-            "db":   data.get("dwh_db",   ""), "user": data.get("dwh_user", ""),
-            "pass": data.get("dwh_pass", ""),
-        },
-        "source": {
-            "ip":      data.get("origen_ip",   ""),  "port": data.get("origen_port", 1433),
-            "db":      data.get("origen_db",   ""),  "user": data.get("origen_user", ""),
-            "pass":    data.get("origen_pass", ""),  "dsn_odbc": data.get("dsn_odbc", ""),
-        },
+        "configs": data.get("configs", []),
+        "dwh": _normalize_warehouse_config(data),
+        "source": _normalize_source_config(data),
     }
+    if is_group_mode():
+        for task in runtime["configs"]:
+            if "source" in task and isinstance(task["source"], dict):
+                task["source"] = _normalize_source_config(task["source"])
+    return runtime
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API — reportar evento al backend (éxito o error)
 # ─────────────────────────────────────────────────────────────────────────────
-def report_event(
+def send_client_event(
     config_id: str,
     task_name: str,
     event_type: str,          # "ok" | "error"
@@ -148,16 +262,14 @@ def report_event(
 ) -> None:
     """
     Informa al backend el resultado de una ejecución de tarea.
-    El backend resuelve grupo + RS desde el token y los almacena.
-    El monitor los mostrará agrupados por grupo y razón social.
     """
     url     = f"{API_BASE_URL}/client-event"
-    headers = {"x-token": CLIENT_TOKEN}
+    headers = build_api_headers()
     payload = {
         "config_id":   config_id,
         "task_name":   task_name,
         "event_type":  event_type,
-        "detail":      detail,
+        "detail":      redact_sensitive_text(detail),
         "rows_loaded": rows_loaded,
     }
     try:
@@ -171,9 +283,9 @@ def report_event(
 # ─────────────────────────────────────────────────────────────────────────────
 # API — notificar last_run_at
 # ─────────────────────────────────────────────────────────────────────────────
-def notify_last_run(config_id: str) -> None:
+def mark_task_last_run(config_id: str) -> None:
     url     = f"{API_BASE_URL}/configs/{config_id}/last_run"
-    headers = {"x-token": CLIENT_TOKEN}
+    headers = build_api_headers()
     try:
         r = requests.put(url, headers=headers, timeout=10)
         if r.status_code != 200:
@@ -183,7 +295,7 @@ def notify_last_run(config_id: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Conexiones
+# Conexiones — Origen (MySQL, SQL Server o PostgreSQL)
 # ─────────────────────────────────────────────────────────────────────────────
 def _detect_sql_server_driver() -> str:
     available = pyodbc.drivers()
@@ -199,41 +311,79 @@ def _detect_sql_server_driver() -> str:
     return "ODBC Driver 17 for SQL Server"
 
 
-def build_source_conn_str() -> str:
-    dsn = _source_config.get("dsn_odbc", "").strip()
+def _build_sqlserver_conn_str(source_config: Dict[str, Any]) -> str:
+    dsn = source_config.get("dsn_odbc", "").strip()
     if dsn:
         parts = [f"DSN={dsn}"]
-        if _source_config.get("user"):
-            parts.append(f"UID={_source_config['user']}")
-        if _source_config.get("pass"):
-            parts.append(f"PWD={_source_config['pass']}")
+        if source_config.get("user"):
+            parts.append(f"UID={source_config['user']}")
+        if source_config.get("pass"):
+            parts.append(f"PWD={source_config['pass']}")
         return ";".join(parts)
 
-    if not _source_config.get("ip"):
+    if not source_config.get("ip"):
         raise ValueError("No hay IP de origen configurada ni DSN ODBC.")
 
     driver = _detect_sql_server_driver()
-    server = _source_config["ip"]
-    port   = _source_config.get("port", 1433)
+    server = source_config["ip"]
+    port   = source_config.get("port", 1433)
     if port and port != 1433:
         server = f"{server},{port}"
 
     return (
         f"DRIVER={{{driver}}};SERVER={server};"
-        f"DATABASE={_source_config['db']};"
-        f"UID={_source_config['user']};PWD={_source_config['pass']};"
+        f"DATABASE={source_config['db']};"
+        f"UID={source_config['user']};PWD={source_config['pass']};"
         f"TrustServerCertificate=yes"
     )
 
 
 @contextmanager
+def _source_connection(source_config: Optional[Dict[str, Any]] = None):
+    """Conexión al origen según origen_tipo: mysql, sqlserver o postgresql."""
+    cfg = source_config or _default_source_config
+    tipo = cfg.get("tipo", "sqlserver") or "sqlserver"
+
+    if tipo == "mysql":
+        if not cfg.get("ip"):
+            raise ValueError("No hay host de origen MySQL configurado.")
+        conn = pymysql.connect(
+            host=cfg["ip"],
+            port=int(cfg.get("port", 3306)),
+            user=cfg["user"],
+            password=cfg["pass"],
+            database=cfg["db"],
+            charset="utf8mb4",
+        )
+    elif tipo == "sqlserver":
+        conn = pyodbc.connect(_build_sqlserver_conn_str(cfg))
+    elif tipo == "postgresql":
+        if not cfg.get("ip"):
+            raise ValueError("No hay host de origen PostgreSQL configurado.")
+        conn = psycopg2.connect(
+            host=cfg["ip"],
+            port=int(cfg.get("port", 5432)),
+            user=cfg["user"],
+            password=cfg["pass"],
+            dbname=cfg["db"],
+        )
+    else:
+        raise ValueError(f"origen_tipo no soportado: {tipo}. Use: mysql, sqlserver, postgresql")
+
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@contextmanager
 def _dwh_connection():
-    if not _dwh_config.get("host"):
+    if not _warehouse_config.get("host"):
         raise ValueError("No hay host DWH configurado.")
-    conn = pymysql.connect(
-        host=_dwh_config["host"],   port=int(_dwh_config["port"]),
-        user=_dwh_config["user"],   password=_dwh_config["pass"],
-        database=_dwh_config["db"], charset="utf8mb4",
+    conn = psycopg2.connect(
+        host=_warehouse_config["host"],   port=int(_warehouse_config["port"]),
+        user=_warehouse_config["user"],   password=_warehouse_config["pass"],
+        dbname=_warehouse_config["db"],
     )
     try:
         yield conn
@@ -242,10 +392,181 @@ def _dwh_connection():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MySQL helpers
+# PostgreSQL helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def quote_ident(name: str) -> str:
-    return f"`{name}`"
+    """PostgreSQL usa comillas dobles para identificadores."""
+    return f'"{name}"'
+
+
+def _column_suggests_pg_temporal(column: str) -> bool:
+    """
+    Columnas que suelen cargarse como DATE/TIMESTAMP en PostgreSQL.
+    (Evita tocar VARCHAR genéricos salvo que el nombre lo indique.)
+    """
+    c = column.lower()
+    if c == "timestamp":
+        return True
+    if "timestamp_hex" in c:
+        return False
+    if "date" in c or "timestamp" in c or c.endswith("_at"):
+        return True
+    return False
+
+
+def sanitize_value_for_postgres(column: str, value: Any) -> Any:
+    """
+    PostgreSQL rechaza fechas inválidas como '1992-00-00' o '0000-00-00'
+    (habituales en SQL Server / MySQL como “fecha vacía”).
+    """
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        return value
+    if not _column_suggests_pg_temporal(column):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s or s.startswith("0000-00-00"):
+            return None
+        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+            try:
+                date.fromisoformat(s[:10])
+            except ValueError:
+                return None
+        return value
+    return value
+
+
+# La BD puede admitir textos amplios; dejar vacío desactiva el truncado por
+# longitud y conserva solamente el saneamiento de fechas inválidas.
+_CUSTOMERS_VARCHAR_LIMITS: Dict[str, int] = {}
+
+
+def truncate_string_for_dwh_table(table: str, column: str, value: Any) -> Any:
+    """
+    Evita StringDataRightTruncation en columnas VARCHAR del DWH cuando el origen trae texto largo.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", errors="replace")
+        except Exception:
+            return value
+    if not isinstance(value, str):
+        return value
+    t = (table or "").lower().strip()
+    if t != "customers":
+        return value
+    key = column.lower().strip().strip('"').strip("'")
+    max_len = _CUSTOMERS_VARCHAR_LIMITS.get(key)
+    if max_len is None or len(value) <= max_len:
+        return value
+    return value[:max_len]
+
+
+def prepare_cell_for_postgres(load_table: str, column: str, value: Any) -> Any:
+    v = sanitize_value_for_postgres(column, value)
+    v = truncate_string_for_dwh_table(load_table, column, v)
+    if isinstance(v, str):
+        v = v.replace("\x00", "")
+    return v
+
+
+def prepare_rows_for_postgres(
+    load_table: str,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+) -> List[tuple]:
+    return [
+        tuple(prepare_cell_for_postgres(load_table, c, v) for c, v in zip(columns, row))
+        for row in rows
+    ]
+
+
+def resolve_upsert_keys_to_columns(
+    columns: Sequence[str], upsert_keys: Sequence[str]
+) -> List[str]:
+    """
+    Alinea nombres del catálogo (p. ej. idAgency) con los que devuelve el driver
+    (p. ej. idagency). Si no coinciden, valid_keys queda vacío y el cliente hace
+    INSERT plano → choques en PK al repetir cargas.
+    """
+    if not columns or not upsert_keys:
+        return []
+    by_lower = {c.lower(): c for c in columns}
+    out: List[str] = []
+    seen: set[str] = set()
+    for k in upsert_keys:
+        if k is None:
+            continue
+        s = str(k).strip()
+        if not s:
+            continue
+        cand = s if s in columns else by_lower.get(s.lower(), "")
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        out.append(cand)
+    return out
+
+
+def maybe_adjust_customers_load(
+    load_table: str,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    upsert_keys: Sequence[str],
+) -> tuple[List[str], List[tuple], List[str]]:
+    """
+    Tabla customers: el destino suele usar id generado (IDENTITY); el upsert
+    natural es idAgency + ndClientDMS. Si el extract trae id del DMS y hacemos
+    ON CONFLICT por agencia+cliente, hay que no insertar esa columna id.
+    """
+    t = (load_table or "").lower().strip()
+    if t != "customers":
+        return list(columns), [tuple(r) for r in rows], list(upsert_keys)
+
+    cols = list(columns)
+    by_lower = {c.lower(): c for c in cols}
+    if "id" not in by_lower:
+        return cols, [tuple(r) for r in rows], list(upsert_keys)
+
+    uk_low = {k.lower() for k in upsert_keys}
+    if "idagency" not in uk_low or "ndclientdms" not in uk_low:
+        return cols, [tuple(r) for r in rows], list(upsert_keys)
+
+    id_name = by_lower["id"]
+    idx = cols.index(id_name)
+    new_cols = [c for i, c in enumerate(cols) if i != idx]
+    new_rows = [tuple(r[i] for i in range(len(r)) if i != idx) for r in rows]
+    new_upsert = [k for k in upsert_keys if k.lower() != "id"]
+    return new_cols, new_rows, new_upsert
+
+
+def dedupe_rows_for_upsert(
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    upsert_keys: Sequence[str],
+) -> List[tuple]:
+    """
+    En un mismo INSERT ... ON CONFLICT, PostgreSQL exige que no haya dos filas
+    propuestas que choquen con el mismo destino (CardinalityViolation).
+
+    Si el extract devuelve varias filas con la misma clave (p. ej. idAgency +
+    ndClientDMS), se deja una por clave: **gana la última** según el orden del
+    resultado del SELECT (conviene ORDER BY timestamp en el origen).
+    """
+    valid_keys = resolve_upsert_keys_to_columns(columns, upsert_keys)
+    if not valid_keys or not rows:
+        return [tuple(r) for r in rows]
+    col_index = {name: i for i, name in enumerate(columns)}
+    idxs = [col_index[k] for k in valid_keys]
+    merged: Dict[tuple, tuple] = {}
+    for row in rows:
+        key = tuple(row[i] for i in idxs)
+        merged[key] = tuple(row)
+    return list(merged.values())
 
 
 def infer_column_types(
@@ -262,12 +583,10 @@ def infer_column_types(
     type_map: Dict[str, str] = {}
     for i, col in enumerate(columns):
         val = samples[i]
-        if isinstance(val, bool):          sql_type = "TINYINT(1)"
-        elif isinstance(val, int):         sql_type = "INT"
-        elif isinstance(val, Decimal):     sql_type = "DECIMAL(18,4)"
-        elif isinstance(val, float):       sql_type = "DOUBLE"
-        elif isinstance(val, datetime):    sql_type = "DATETIME"
-        elif isinstance(val, date):        sql_type = "DATE"
+        if isinstance(val, bool):          sql_type = "BOOLEAN"
+        elif isinstance(val, datetime):   sql_type = "TIMESTAMP"
+        elif isinstance(val, date):       sql_type = "DATE"
+        elif isinstance(val, Decimal):    sql_type = "DECIMAL(18,4)"
         else:                              sql_type = "TEXT"
         type_map[col] = sql_type
     return type_map
@@ -278,32 +597,61 @@ def create_table_if_missing(
     columns: Sequence[str], column_types: Dict[str, str],
     upsert_keys: Sequence[str],
 ) -> None:
-    col_defs = []
+    """
+    Crea la tabla si no existe. Si el origen no trae columna ``id``, se añade
+    ``id BIGSERIAL PRIMARY KEY`` y las claves de upsert pasan a ser UNIQUE
+    (el INSERT no incluye ``id``; PostgreSQL lo rellena).
+    Si el origen ya trae ``id``, se mantiene el esquema anterior (PK en
+    claves de negocio cuando hay upsert_keys).
+    """
+    has_source_id = any((c or "").lower() == "id" for c in columns)
+    col_defs: List[str] = []
+    if not has_source_id:
+        col_defs.append("id BIGSERIAL PRIMARY KEY")
+
     for col in columns:
         sql_type = column_types[col]
-        if sql_type == "TEXT" and col in upsert_keys:
-            sql_type = "VARCHAR(255)"
         col_defs.append(f"{quote_ident(col)} {sql_type}")
 
-    valid_keys = [k for k in upsert_keys if k in columns]
-    if valid_keys:
+    valid_keys = resolve_upsert_keys_to_columns(columns, upsert_keys)
+    if not has_source_id:
+        if valid_keys:
+            uniq = ", ".join(quote_ident(k) for k in valid_keys)
+            col_defs.append(f"UNIQUE ({uniq})")
+    elif valid_keys:
         pk = ", ".join(quote_ident(k) for k in valid_keys)
         col_defs.append(f"PRIMARY KEY ({pk})")
 
     cursor.execute(
         f"CREATE TABLE IF NOT EXISTS {quote_ident(table)} "
-        f"({', '.join(col_defs)}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        f"({', '.join(col_defs)})"
     )
 
 
+def pg_table_exists(cursor: Any, table: str) -> bool:
+    """True si existe relación en public (nombre sin comillas = minúsculas en PG)."""
+    cursor.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name = %s",
+        (table.lower(),),
+    )
+    return cursor.fetchone() is not None
+
+
 def ensure_columns_exist(
-    cursor: Any, table: str, db_name: str,
+    cursor: Any, table: str,
     columns: Sequence[str], col_types: Dict[str, str],
 ) -> None:
+    """
+    Verifica que la tabla PostgreSQL tenga todas las columnas que los datos
+    necesitan.  Si faltan, las agrega con ALTER TABLE ADD COLUMN usando el
+    tipo inferido (TEXT por defecto).  Evita errores de 'column X does not
+    exist' cuando un SP devuelve columnas no previstas en el DDL original.
+    """
     cursor.execute(
         "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = %s AND table_name = %s",
-        (db_name, table)
+        "WHERE table_schema = 'public' AND table_name = %s",
+        (table.lower(),),
     )
     existing = {row[0] for row in cursor.fetchall()}
     existing_lower = {n.lower() for n in existing}
@@ -322,30 +670,64 @@ def ensure_columns_exist(
         log.info("  %d columna(s) añadida(s) a '%s'.", added, table)
 
 
+def build_upsert_sql_values_template(table: str, columns: Sequence[str], upsert_keys: Sequence[str]) -> str:
+    """SQL para execute_values: INSERT ... VALUES %s ON CONFLICT ... (sin placeholders %s por columna)."""
+    cols_sql     = ", ".join(quote_ident(c) for c in columns)
+    valid_keys   = resolve_upsert_keys_to_columns(columns, upsert_keys)
+
+    if not valid_keys:
+        return f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES %s"
+
+    vk_set = set(valid_keys)
+    update_cols = [c for c in columns if c not in vk_set]
+    conflict_cols = ", ".join(quote_ident(k) for k in valid_keys)
+    if not update_cols:
+        return (
+            f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES %s "
+            f"ON CONFLICT ({conflict_cols}) DO NOTHING"
+        )
+    set_clause = ", ".join(
+        f"{quote_ident(c)} = EXCLUDED.{quote_ident(c)}" for c in update_cols
+    )
+    return (
+        f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES %s "
+        f"ON CONFLICT ({conflict_cols}) DO UPDATE SET {set_clause}"
+    )
+
+
 def build_upsert_sql(table: str, columns: Sequence[str], upsert_keys: Sequence[str]) -> str:
     cols_sql     = ", ".join(quote_ident(c) for c in columns)
     placeholders = ", ".join("%s" for _ in columns)
-    valid_keys   = [k for k in upsert_keys if k in columns]
+    valid_keys   = resolve_upsert_keys_to_columns(columns, upsert_keys)
 
     if not valid_keys:
         return f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES ({placeholders})"
 
-    update_cols = [c for c in columns if c not in valid_keys]
+    vk_set = set(valid_keys)
+    update_cols = [c for c in columns if c not in vk_set]
     if not update_cols:
-        return f"INSERT IGNORE INTO {quote_ident(table)} ({cols_sql}) VALUES ({placeholders})"
+        # INSERT ... ON CONFLICT DO NOTHING
+        conflict_cols = ", ".join(quote_ident(k) for k in valid_keys)
+        return (
+            f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES ({placeholders}) "
+            f"ON CONFLICT ({conflict_cols}) DO NOTHING"
+        )
 
+    # INSERT ... ON CONFLICT DO UPDATE
+    conflict_cols = ", ".join(quote_ident(k) for k in valid_keys)
     set_clause = ", ".join(
-        f"{quote_ident(c)} = VALUES({quote_ident(c)})" for c in update_cols
+        f"{quote_ident(c)} = EXCLUDED.{quote_ident(c)}" for c in update_cols
     )
     return (
         f"INSERT INTO {quote_ident(table)} ({cols_sql}) VALUES ({placeholders}) "
-        f"ON DUPLICATE KEY UPDATE {set_clause}"
+        f"ON CONFLICT ({conflict_cols}) DO UPDATE SET {set_clause}"
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Nombres de columnas: unificar orígenes (SP/vistas) sin cambiar cada BD
+# Nombres de columnas: unificar orígenes distintos (SP/vistas) sin tocar cada BD
 # ─────────────────────────────────────────────────────────────────────────────
+# Clave = nombre que devuelve pyodbc (comparación sin distinguir mayúsculas).
 _DWH_COLUMN_SYNONYMS: Dict[str, Dict[str, str]] = {
     "services": {
         "servicer_to_performe": "service_to_perform",
@@ -378,6 +760,10 @@ def merge_row_columns_if_duplicate_names(
     *,
     task_id: str = "",
 ) -> Tuple[List[str], List[tuple]]:
+    """
+    Tras renombrar, si dos columnas distintas quedan con el mismo nombre,
+    se unen en una sola por fila (prioridad al último valor no nulo).
+    """
     if not columns:
         return [], [tuple(r) for r in rows]
 
@@ -422,6 +808,11 @@ def merge_row_columns_if_duplicate_names(
 # Ejecutar tarea
 # ─────────────────────────────────────────────────────────────────────────────
 def normalize_last_run_for_tsql(last_run_at: Optional[str]) -> str:
+    """
+    El API devuelve last_run_at en ISO-8601 (p. ej. 2025-03-27T14:30:00.123456).
+    SQL Server falla a menudo con varchar '...T...' o con offset (+00:00) en literales.
+    Se convierte a 'YYYY-MM-DD HH:MM:SS.mmm' (naive, UTC si venía con zona).
+    """
     default = "1900-01-01 00:00:00"
     if not last_run_at:
         return default
@@ -457,12 +848,13 @@ def run_task(task: Dict[str, Any]) -> int:
     task_id          = task["id"]
     task_name        = task["name"]
     load_table       = task["load_table"]
-    upsert_keys      = task.get("upsert_keys") or []
+    upsert_keys_raw  = task.get("upsert_keys") or []
     query_tabla      = task.get("query_tabla_destino")
     query_constraint = task.get("query_constraint")
     last_run_at      = task.get("last_run_at")
 
-    if not _dwh_config or not _source_config:
+    task_source_config = task.get("source") or _default_source_config
+    if not _warehouse_config or not task_source_config:
         raise RuntimeError("Conexiones no configuradas.")
 
     if _verbose:
@@ -487,20 +879,21 @@ def run_task(task: Dict[str, Any]) -> int:
         except Exception as exc:
             log.warning("  Constraint falló (puede que ya exista): %s", exc)
 
-    # 3) Extraer desde SQL Server
+    # 3) Extraer desde origen (MySQL, SQL Server o PostgreSQL)
     extract_sql = prepare_extract_sql(task["extract_sql"], last_run_at)
-    with pyodbc.connect(build_source_conn_str()) as conn:
+    with _source_connection(task_source_config) as conn:
         cur = conn.cursor()
         cur.execute(extract_sql)
-        rows         = cur.fetchall()
-        columns_raw  = [d[0] for d in (cur.description or [])]
+        rows    = cur.fetchall()
+        columns_raw = [d[0] for d in (cur.description or [])]
 
     columns = canonicalize_dwh_column_names(load_table, columns_raw)
     if any(a != b for a, b in zip(columns_raw, columns)):
         diff = {a: b for a, b in zip(columns_raw, columns) if a != b}
         log.info("  Tarea %s: columnas alineadas al DWH: %s", task_id, diff)
 
-    columns, rows_merged = merge_row_columns_if_duplicate_names(
+    rows_list: List[tuple]
+    columns, rows_list = merge_row_columns_if_duplicate_names(
         columns, rows, task_id=str(task_id)
     )
 
@@ -508,38 +901,74 @@ def run_task(task: Dict[str, Any]) -> int:
         log.warning("  Tarea %s: sin columnas, se omite.", task_id)
         return 0
 
-    rows_tuples = [
-        tuple(
-            v.replace("\x00", "") if isinstance(v, str) else v
-            for v in row
+    orig_ncol = len(columns)
+    rows_tuples = prepare_rows_for_postgres(load_table, columns, rows_list)
+    upsert_keys = resolve_upsert_keys_to_columns(columns, upsert_keys_raw)
+    if not upsert_keys and (load_table or "").lower().strip() == "customers":
+        upsert_keys = resolve_upsert_keys_to_columns(
+            columns, ["idAgency", "ndClientDMS"]
         )
-        for row in rows_merged
-    ]
+        if upsert_keys:
+            log.info(
+                "  Tarea %s: upsert_keys vacío en catálogo; usando %s.",
+                task_id,
+                ", ".join(upsert_keys),
+            )
+    columns, rows_tuples, upsert_keys = maybe_adjust_customers_load(
+        load_table, columns, rows_tuples, upsert_keys
+    )
+    if (load_table or "").lower().strip() == "customers" and len(columns) < orig_ncol:
+        log.info(
+            "  Tarea %s: customers — se omite columna id del origen (IDENTITY en destino).",
+            task_id,
+        )
+    n_raw = len(rows_tuples)
+    rows_tuples = dedupe_rows_for_upsert(columns, rows_tuples, upsert_keys)
+    n_dedup = len(rows_tuples)
+    if n_raw > n_dedup:
+        log.warning(
+            "  Tarea %s: %d filas duplicadas por clave upsert en el mismo lote "
+            "(se usa la última por clave): %d → %d.",
+            task_id,
+            n_raw - n_dedup,
+            n_raw,
+            n_dedup,
+        )
     if _verbose:
-        log.info("  Filas extraídas: %d", len(rows_tuples))
+        log.info("  Filas a cargar: %d", n_dedup)
 
-    # 4) Crear tabla inferida si no hay DDL; asegurar columnas si ya existe
+    # 4) Si la tabla destino no existe, crearla (inferida). Cubre el caso en que
+    #    query_tabla_destino sigue creando customers_vehicle / last_customer_sale
+    #    pero load_table ya es customer_vehicle / last_customer_seller.
     col_types = infer_column_types(columns, rows_tuples)
-    if not query_tabla:
-        with _dwh_connection() as conn:
-            cur = conn.cursor()
-            create_table_if_missing(cur, load_table, columns, col_types, upsert_keys)
-            conn.commit()
-
     with _dwh_connection() as conn:
         cur = conn.cursor()
-        ensure_columns_exist(cur, load_table, _dwh_config["db"], columns, col_types)
+        if not pg_table_exists(cur, load_table):
+            create_table_if_missing(cur, load_table, columns, col_types, upsert_keys)
+            if _verbose:
+                log.info(
+                    "  Tabla '%s' creada en el DWH (no existía; revisa DDL del catálogo).",
+                    load_table,
+                )
+        ensure_columns_exist(cur, load_table, columns, col_types)
         conn.commit()
 
-    # 5) Upsert
-    upsert_sql = build_upsert_sql(load_table, columns, upsert_keys)
+    # 5) Upsert con execute_values (10-50x más rápido que executemany)
+    CHUNK_SIZE = 20000
+    PAGE_SIZE = 5000
+    upsert_sql = build_upsert_sql_values_template(load_table, columns, upsert_keys)
     with _dwh_connection() as conn:
         cur = conn.cursor()
         if rows_tuples:
-            cur.executemany(upsert_sql, rows_tuples)
-            conn.commit()
-            if _verbose:
-                log.info("  Filas cargadas: %d", len(rows_tuples))
+            total = len(rows_tuples)
+            log.info("  Cargando %d filas (execute_values)...", total)
+            for i in range(0, total, CHUNK_SIZE):
+                chunk = rows_tuples[i : i + CHUNK_SIZE]
+                psycopg2.extras.execute_values(cur, upsert_sql, chunk, page_size=PAGE_SIZE)
+                conn.commit()
+                loaded = min(i + len(chunk), total)
+                log.info("  Cargadas %d / %d filas (%.0f%%)", loaded, total, 100.0 * loaded / total)
+            log.info("  Filas cargadas: %d", total)
         else:
             if _verbose:
                 log.info("  Sin filas nuevas.")
@@ -586,20 +1015,20 @@ RETRY_SECONDS = 30
 
 
 def run_scheduler() -> None:
-    global _verbose, _dwh_config, _source_config
+    global _verbose, _warehouse_config, _default_source_config
 
     configs: List[Dict[str, Any]] = []
     last_config_refresh: float = 0
     refresh_seconds: int = 60
 
-    log.info("Scheduler iniciado.")
+    log.info("Scheduler iniciado (PostgreSQL).")
 
     while True:
         now = time.time()
 
         # ── Refrescar configs ──
         if now - last_config_refresh >= refresh_seconds:
-            result = fetch_configs()
+            result = fetch_runtime_config()
             status = result["status"]
 
             if status == "unreachable":
@@ -620,10 +1049,10 @@ def run_scheduler() -> None:
                 time.sleep(RETRY_SECONDS)
                 continue
 
-            _verbose       = result["log_verbose"]
-            _dwh_config    = result["dwh"]
-            _source_config = result["source"]
-            nuevas         = result["configs"]
+            _verbose = result["log_verbose"]
+            _warehouse_config = result["dwh"]
+            _default_source_config = result["source"]
+            nuevas = result["configs"]
 
             new_refresh = result["refresh_seconds"]
             if new_refresh != refresh_seconds:
@@ -665,10 +1094,10 @@ def run_scheduler() -> None:
                 executed += 1
 
                 # Notificar last_run_at al backend
-                notify_last_run(task_id)
+                mark_task_last_run(task_id)
 
                 # Reportar ejecución exitosa al monitor
-                report_event(
+                send_client_event(
                     config_id=task_id,
                     task_name=task_name,
                     event_type="ok",
@@ -679,11 +1108,18 @@ def run_scheduler() -> None:
             except Exception as exc:
                 _last_run_ts[task_id] = time.time()
                 errors += 1
-                error_msg = traceback.format_exc()
-                log.error("Error en tarea %s: %s", task_id, exc, exc_info=True)
+                task_source_config = task.get("source") or _default_source_config
+                error_msg = redact_sensitive_text(
+                    traceback.format_exc(),
+                    extra_values=[
+                        str(task_source_config.get("pass", "")),
+                        str(task_source_config.get("user", "")),
+                    ],
+                )
+                log.error("Error en tarea %s: %s\n%s", task_id, exc, error_msg)
 
                 # Reportar error al monitor (con traceback completo)
-                report_event(
+                send_client_event(
                     config_id=task_id,
                     task_name=task_name,
                     event_type="error",
@@ -700,8 +1136,11 @@ def run_scheduler() -> None:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    log.info("=== Nexus DWH Client ===")
-    log.info("Servidor : %s", API_BASE_URL)
+    validate_api_url_security()
+    log.info("=== Nexus DWH Client (PostgreSQL) ===")
+    log.info("Server   : %s", API_BASE_URL)
+    log.info("Mode     : %s", _client_mode_label())
+    log.info("Token    : %s", _mask_active_client_token())
     log.info("Logs     : %s", _LOGS_DIR)
     try:
         run_scheduler()
