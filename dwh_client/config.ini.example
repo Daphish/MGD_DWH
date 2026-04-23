@@ -1,7 +1,10 @@
 [nexus]
-; Token único que identifica la razón social de este cliente.
-; El servidor lo usa para saber qué configuraciones enviar.
+; Company token (legacy/current flow).
 token = TU_TOKEN_AQUI
 
-; URL base de la API del servidor DWH.
+; Group token (special flow for all companies in a group).
+group_token =
+
+; Base URL of the backend API.
+; Use HTTPS in real deployments. HTTP is acceptable only for localhost/dev.
 api_url = http://127.0.0.1:8000

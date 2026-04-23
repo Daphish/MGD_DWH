@@ -32,6 +32,12 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except ImportError:  # pragma: no cover - dependencia opcional en dev
+    Fernet = None
+    InvalidToken = Exception
+
 app = FastAPI(title="Nexus Config API", version="3.0.0")
 
 
@@ -52,6 +58,10 @@ DB_NAME       = _ini.get("database", "db",       fallback="nexus_config")
 DB_USER       = _ini.get("database", "user",     fallback="root")
 DB_PASS       = _ini.get("database", "password", fallback="")
 MONITOR_TOKEN = _ini.get("monitor",  "token",    fallback="")
+CONFIG_SECRET_KEY = _ini.get(
+    "security", "config_secret_key",
+    fallback=os.environ.get("NEXUS_CONFIG_SECRET_KEY", ""),
+).strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,6 +107,38 @@ def get_connection() -> pymysql.connections.Connection:
         host=DB_HOST, port=DB_PORT, user=DB_USER,
         password=DB_PASS, database=DB_NAME, charset="utf8mb4",
     )
+
+
+_secret_cipher: Optional["Fernet"] = None
+
+
+def get_secret_cipher() -> Optional["Fernet"]:
+    global _secret_cipher
+    if _secret_cipher is not None:
+        return _secret_cipher
+    if not CONFIG_SECRET_KEY or Fernet is None:
+        return None
+    _secret_cipher = Fernet(CONFIG_SECRET_KEY.encode("utf-8"))
+    return _secret_cipher
+
+
+def decrypt_config_secret(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    if not value.startswith("ENC:"):
+        return value
+    cipher = get_secret_cipher()
+    if cipher is None:
+        raise RuntimeError(
+            "Se encontró un secreto cifrado pero falta cryptography o config_secret_key."
+        )
+    token = value[4:].strip().encode("utf-8")
+    try:
+        return cipher.decrypt(token).decode("utf-8")
+    except InvalidToken as exc:
+        raise RuntimeError("No se pudo descifrar un secreto de configuración.") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,20 +305,20 @@ def check_token_status(token: str) -> dict:
         "rs_enabled":      bool(row[2]),
         "log_verbose":     bool(row[3]),
         "refresh_seconds": row[4],
-        "dsn_odbc":        row[5]  or "",
-        "origen_ip":       row[6]  or "",
+        "dsn_odbc":        decrypt_config_secret(row[5]  or ""),
+        "origen_ip":       decrypt_config_secret(row[6]  or ""),
         "origen_port":     row[7],
-        "origen_db":       row[8]  or "",
-        "origen_user":     row[9]  or "",
-        "origen_pass":     row[10] or "",
+        "origen_db":       decrypt_config_secret(row[8]  or ""),
+        "origen_user":     decrypt_config_secret(row[9]  or ""),
+        "origen_pass":     decrypt_config_secret(row[10] or ""),
         "grupo_id":        row[11],
         "grupo_nombre":    row[12],
         "grupo_enabled":   bool(row[13]),
-        "dwh_host":        row[14] or "",
+        "dwh_host":        decrypt_config_secret(row[14] or ""),
         "dwh_port":        row[15],
-        "dwh_db":          row[16] or "",
-        "dwh_user":        row[17] or "",
-        "dwh_pass":        row[18] or "",
+        "dwh_db":          decrypt_config_secret(row[16] or ""),
+        "dwh_user":        decrypt_config_secret(row[17] or ""),
+        "dwh_pass":        decrypt_config_secret(row[18] or ""),
     }
 
 
